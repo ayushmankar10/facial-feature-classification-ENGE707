@@ -1,0 +1,12 @@
+# Competition dataset
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Trained models and generated predictions
+models/
+outputs/
