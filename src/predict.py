@@ -2,7 +2,6 @@ import argparse
 import multiprocessing
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 
@@ -28,6 +27,16 @@ from utils import (
 )
 
 
+def matching_key(value):
+    """Match numeric filenames with or without leading zeros."""
+    stem = Path(str(value)).stem
+
+    if stem.isdecimal():
+        return str(int(stem))
+
+    return stem
+
+
 def make_test_frame(sample, test_dir=TEST_DIR):
     if (
         list(sample.columns) != ["image_id", "class"]
@@ -47,34 +56,59 @@ def make_test_frame(sample, test_dir=TEST_DIR):
         )
 
     if not test_dir.is_dir():
-        raise FileNotFoundError(test_dir)
+        raise FileNotFoundError(
+            f"Test folder not found: {test_dir}"
+        )
 
     lookup = {}
 
-    # Locate test inputs solely for final prediction.
+    # Locate test images solely for generating predictions.
     for path in sorted(test_dir.rglob("*")):
         if (
             path.is_file()
             and path.suffix.lower() in IMAGE_EXTENSIONS
         ):
-            if path.stem in lookup:
+            key = matching_key(path.name)
+
+            if key in lookup:
                 raise ValueError(
-                    f"Ambiguous test filename: {path.stem}"
+                    f"Multiple test files match ID {key}: "
+                    f"{lookup[key].name} and {path.name}"
                 )
 
-            lookup[path.stem] = path
+            lookup[key] = path
+
+    if not lookup:
+        raise FileNotFoundError(
+            f"No test images found inside: {test_dir}"
+        )
+
+    template_keys = sample["image_id"].map(matching_key)
+
+    if template_keys.duplicated().any():
+        raise ValueError(
+            "Multiple template IDs refer to the same "
+            "numeric image ID."
+        )
 
     rows = []
 
     for image_id in sample["image_id"]:
-        key = Path(str(image_id)).stem
+        key = matching_key(image_id)
 
         if key not in lookup:
+            examples = [
+                path.name
+                for path in list(lookup.values())[:5]
+            ]
+
             raise FileNotFoundError(
-                f"No test file for template ID {image_id}"
+                f"No test file for template ID {image_id}. "
+                f"Example test filenames: {examples}"
             )
 
         rows.append({
+            # Preserve the exact ID from the sample template.
             "image_id": str(image_id),
             "path": (
                 lookup[key]
@@ -85,9 +119,15 @@ def make_test_frame(sample, test_dir=TEST_DIR):
 
     if len(lookup) != len(rows):
         raise ValueError(
-            "Test image count does not match "
-            "the submission template."
+            f"Found {len(lookup):,} test images, but the "
+            f"template contains {len(rows):,} rows."
         )
+
+    print(
+        f"Matched all {len(rows):,} template IDs "
+        "to test images.",
+        flush=True,
+    )
 
     return pd.DataFrame(rows)
 
@@ -102,11 +142,13 @@ def main():
         type=Path,
         nargs="+",
         required=True,
+        help="One or more trained model checkpoints.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         required=True,
+        help="Output submission CSV path.",
     )
     parser.add_argument(
         "--workers",
@@ -121,6 +163,7 @@ def main():
     parser.add_argument(
         "--flip-tta",
         action="store_true",
+        help="Average predictions from original and flipped images.",
     )
     parser.add_argument(
         "--allow-cpu",
@@ -129,16 +172,28 @@ def main():
 
     args = parser.parse_args()
 
+    if args.batch_size < 1 or args.workers < 0:
+        parser.error(
+            "batch-size must be positive and workers "
+            "must be zero or greater."
+        )
+
+    if args.output.suffix.lower() != ".csv":
+        parser.error("--output must end in .csv")
+
     metadata_path = args.output.with_suffix(".json")
 
-    if (
-        args.output.exists()
-        or metadata_path.exists()
-    ):
+    if args.output.exists() or metadata_path.exists():
         raise FileExistsError(
             "Submission or metadata already exists. "
-            "Choose a new output name."
+            "Choose a new output filename."
         )
+
+    for checkpoint_path in args.checkpoint:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {checkpoint_path}"
+            )
 
     torch.set_num_threads(4)
 
@@ -155,13 +210,11 @@ def main():
 
     for checkpoint_path in args.checkpoint:
         print(
-            f"Predicting with: {checkpoint_path}",
+            f"\nPredicting with: {checkpoint_path}",
             flush=True,
         )
 
-        checkpoint = load_checkpoint(
-            checkpoint_path
-        )
+        checkpoint = load_checkpoint(checkpoint_path)
 
         if checkpoint.get("smoke"):
             raise ValueError(
@@ -183,6 +236,12 @@ def main():
         model.to(
             device,
             memory_format=torch.channels_last,
+        )
+
+        print(
+            f"Model device: "
+            f"{next(model.parameters()).device}",
+            flush=True,
         )
 
         dataset = FacialDataset(
@@ -208,8 +267,8 @@ def main():
 
         if ids != sample["image_id"].tolist():
             raise RuntimeError(
-                "Prediction order does not "
-                "match the template."
+                "Prediction order does not match "
+                "the sample template."
             )
 
         if average_probabilities is None:
@@ -239,7 +298,8 @@ def main():
     validate_submission(submission, sample)
 
     args.output.parent.mkdir(
-        parents=True, exist_ok=True
+        parents=True,
+        exist_ok=True,
     )
 
     submission.to_csv(
@@ -266,7 +326,7 @@ def main():
     print(
         f"\nValidated {len(submission):,} predictions."
     )
-    print(f"Saved to: {args.output}")
+    print(f"Submission saved to: {args.output}")
     print(
         "Upload this CSV through Kaggle "
         "Submit Prediction."
