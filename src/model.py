@@ -1,13 +1,23 @@
-import torch.nn as nn
+"""Transfer-learning models with a shared eight-class output."""
 
+import torch.nn as nn
 from torchvision.models import (
     EfficientNet_B0_Weights,
+    EfficientNet_V2_S_Weights,
     ResNet18_Weights,
     efficientnet_b0,
+    efficientnet_v2_s,
     resnet18,
 )
 
 from config import CLASSES
+
+
+HEAD_PREFIXES = {
+    "efficientnet_b0": "classifier.",
+    "efficientnet_v2_s": "classifier.",
+    "resnet18": "fc.",
+}
 
 
 def build_model(
@@ -20,8 +30,20 @@ def build_model(
             if pretrained
             else None
         )
-
         model = efficientnet_b0(weights=weights)
+
+        model.classifier[1] = nn.Linear(
+            model.classifier[1].in_features,
+            len(CLASSES),
+        )
+
+    elif architecture == "efficientnet_v2_s":
+        weights = (
+            EfficientNet_V2_S_Weights.DEFAULT
+            if pretrained
+            else None
+        )
+        model = efficientnet_v2_s(weights=weights)
 
         model.classifier[1] = nn.Linear(
             model.classifier[1].in_features,
@@ -34,7 +56,6 @@ def build_model(
             if pretrained
             else None
         )
-
         model = resnet18(weights=weights)
 
         model.fc = nn.Linear(
@@ -51,13 +72,14 @@ def build_model(
 
 
 def is_head(name, architecture):
-    prefix = (
-        "classifier."
-        if architecture == "efficientnet_b0"
-        else "fc."
-    )
+    if architecture not in HEAD_PREFIXES:
+        raise ValueError(
+            f"Unsupported architecture: {architecture}"
+        )
 
-    return name.startswith(prefix)
+    return name.startswith(
+        HEAD_PREFIXES[architecture]
+    )
 
 
 def set_trainable(
@@ -66,34 +88,29 @@ def set_trainable(
     freeze_backbone,
 ):
     for name, parameter in model.named_parameters():
-        trainable = (
+        parameter.requires_grad_(
             not freeze_backbone
             or is_head(name, architecture)
         )
 
-        parameter.requires_grad_(trainable)
-
 
 def parameter_groups(model, config):
-    backbone_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if not is_head(name, config.architecture)
-    ]
+    backbone = []
+    head = []
 
-    head_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if is_head(name, config.architecture)
-    ]
+    for name, parameter in model.named_parameters():
+        if is_head(name, config.architecture):
+            head.append(parameter)
+        else:
+            backbone.append(parameter)
 
     return [
         {
-            "params": backbone_parameters,
+            "params": backbone,
             "lr": config.learning_rate,
         },
         {
-            "params": head_parameters,
+            "params": head,
             "lr": config.head_learning_rate,
         },
     ]

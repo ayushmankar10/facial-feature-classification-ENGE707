@@ -1,4 +1,4 @@
-"""Train with CUDA, CPU data workers and saved preprocessing."""
+"""Train with CUDA, CPU workers and saved preprocessing."""
 
 import argparse
 import multiprocessing
@@ -9,23 +9,14 @@ import pandas as pd
 import torch
 from torch import nn
 
-from config import (
-    CLASSES,
-    PROJECT_ROOT,
-    SPLIT_DIR,
-    TrainConfig,
-)
+from config import CLASSES, PROJECT_ROOT, SPLIT_DIR, TrainConfig
 from dataset import (
     FacialDataset,
     build_transforms,
     make_loader,
     read_split,
 )
-from model import (
-    build_model,
-    parameter_groups,
-    set_trainable,
-)
+from model import build_model, parameter_groups, set_trainable
 from utils import (
     choose_device,
     save_checkpoint,
@@ -50,11 +41,9 @@ def run_epoch(
     model.train(training)
 
     if training and freeze_backbone:
+        # Frozen backbone BatchNorm statistics must not update.
         for module in model.modules():
-            if isinstance(
-                module,
-                nn.modules.batchnorm._BatchNorm,
-            ):
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
                 module.eval()
 
     totals = torch.zeros(
@@ -64,10 +53,7 @@ def run_epoch(
     )
     started = time.perf_counter()
 
-    for step, (images, labels, _) in enumerate(
-        loader,
-        start=1,
-    ):
+    for step, (images, labels, _) in enumerate(loader, start=1):
         images = images.to(
             device,
             non_blocking=True,
@@ -89,16 +75,11 @@ def run_epoch(
             if training:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    5.0,
-                )
+                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 scaler.step(optimizer)
                 scaler.update()
 
-        totals[0] += (
-            loss.detach().double() * labels.size(0)
-        )
+        totals[0] += loss.detach().double() * labels.size(0)
         totals[1] += (
             logits.detach().argmax(1) == labels
         ).sum()
@@ -119,25 +100,31 @@ def run_epoch(
     if count == 0:
         raise ValueError("Data loader produced no images.")
 
+    elapsed = time.perf_counter() - started
+
     return {
         "loss": loss_sum / count,
         "accuracy": correct / count,
-        "images_per_second": (
-            count / (time.perf_counter() - started)
-        ),
+        "images_per_second": count / elapsed,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     defaults = TrainConfig()
 
-    parser.add_argument("--run", required=True)
+    parser.add_argument(
+        "--run",
+        required=True,
+        help="Unique experiment folder name.",
+    )
     parser.add_argument(
         "--architecture",
-        choices=("efficientnet_b0", "resnet18"),
+        choices=(
+            "efficientnet_b0",
+            "efficientnet_v2_s",
+            "resnet18",
+        ),
         default=defaults.architecture,
     )
     parser.add_argument(
@@ -179,18 +166,9 @@ def main():
             default=getattr(defaults, name),
         )
 
-    parser.add_argument(
-        "--no-pretrained",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--no-amp",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--allow-cpu",
-        action="store_true",
-    )
+    parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -233,8 +211,8 @@ def main():
         or config.cpu_threads < 1
     ):
         parser.error(
-            "epochs/threads must be positive, "
-            "workers >= 0 and batch-size >= 2."
+            "epochs/threads must be positive, workers >= 0 "
+            "and batch-size >= 2."
         )
 
     if (
@@ -299,7 +277,7 @@ def main():
             "Training and validation data overlap."
         )
 
-    # Size filtering affects training only.
+    # Optional size filtering affects training only.
     minimum_side = train_frame[
         ["width", "height"]
     ].min(axis=1)
@@ -336,6 +314,7 @@ def main():
             resize_mode=config.resize_mode,
         ),
     )
+
     validation_dataset = FacialDataset(
         validation_frame,
         build_transforms(
@@ -352,6 +331,7 @@ def main():
         cuda=device.type == "cuda",
         seed=config.seed,
     )
+
     validation_loader = make_loader(
         validation_dataset,
         config.batch_size,
@@ -368,14 +348,13 @@ def main():
         memory_format=torch.channels_last,
     )
 
+    print(f"Architecture: {config.architecture}", flush=True)
     print(
         f"Model device: {next(model.parameters()).device}",
         flush=True,
     )
-    print(
-        f"Resize mode: {config.resize_mode}",
-        flush=True,
-    )
+    print(f"Resize mode: {config.resize_mode}", flush=True)
+    print(f"Batch size: {config.batch_size}", flush=True)
     print(
         f"CPU workers per loader: {config.workers}",
         flush=True,
@@ -390,12 +369,12 @@ def main():
         parameter_groups(model, config),
         weight_decay=config.weight_decay,
     )
-    scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=config.epochs,
-        )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config.epochs,
     )
+
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=config.amp and device.type == "cuda",
@@ -446,6 +425,7 @@ def main():
             f"frozen backbone: {frozen}",
             flush=True,
         )
+
         started = time.perf_counter()
 
         train_stats = run_epoch(
@@ -459,6 +439,7 @@ def main():
             freeze_backbone=frozen,
             max_batches=2 if args.smoke else 0,
         )
+
         validation_stats = run_epoch(
             model,
             validation_loader,
@@ -480,12 +461,14 @@ def main():
                 train_stats["images_per_second"]
             ),
         }
+
         history.append(row)
 
         pd.DataFrame(history).to_csv(
             run_dir / "history.csv",
             index=False,
         )
+
         scheduler.step()
 
         improved = (
