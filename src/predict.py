@@ -1,3 +1,5 @@
+"""Generate submissions using each checkpoint's preprocessing."""
+
 import argparse
 import multiprocessing
 from pathlib import Path
@@ -55,6 +57,8 @@ def make_test_frame(sample, test_dir=TEST_DIR):
             "Template IDs must be present and unique."
         )
 
+    test_dir = Path(test_dir)
+
     if not test_dir.is_dir():
         raise FileNotFoundError(
             f"Test folder not found: {test_dir}"
@@ -62,7 +66,6 @@ def make_test_frame(sample, test_dir=TEST_DIR):
 
     lookup = {}
 
-    # Locate test images solely for generating predictions.
     for path in sorted(test_dir.rglob("*")):
         if (
             path.is_file()
@@ -101,14 +104,12 @@ def make_test_frame(sample, test_dir=TEST_DIR):
                 path.name
                 for path in list(lookup.values())[:5]
             ]
-
             raise FileNotFoundError(
                 f"No test file for template ID {image_id}. "
                 f"Example test filenames: {examples}"
             )
 
         rows.append({
-            # Preserve the exact ID from the sample template.
             "image_id": str(image_id),
             "path": (
                 lookup[key]
@@ -134,9 +135,8 @@ def make_test_frame(sample, test_dir=TEST_DIR):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a Kaggle submission CSV."
+        description=__doc__
     )
-
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -148,7 +148,6 @@ def main():
         "--output",
         type=Path,
         required=True,
-        help="Output submission CSV path.",
     )
     parser.add_argument(
         "--workers",
@@ -163,13 +162,11 @@ def main():
     parser.add_argument(
         "--flip-tta",
         action="store_true",
-        help="Average predictions from original and flipped images.",
     )
     parser.add_argument(
         "--allow-cpu",
         action="store_true",
     )
-
     args = parser.parse_args()
 
     if args.batch_size < 1 or args.workers < 0:
@@ -196,17 +193,16 @@ def main():
             )
 
     torch.set_num_threads(4)
-
     device = choose_device(args.allow_cpu)
 
     sample = pd.read_csv(
         SAMPLE_PATH,
         dtype={"image_id": "string"},
     )
-
     frame = make_test_frame(sample)
 
     average_probabilities = None
+    model_details = []
 
     for checkpoint_path in args.checkpoint:
         print(
@@ -223,16 +219,17 @@ def main():
             )
 
         config = checkpoint["config"]
+        resize_mode = config.get(
+            "resize_mode", "stretch"
+        )
 
         model = build_model(
             config["architecture"],
             pretrained=False,
         )
-
         model.load_state_dict(
             checkpoint["model_state"]
         )
-
         model.to(
             device,
             memory_format=torch.channels_last,
@@ -243,13 +240,19 @@ def main():
             f"{next(model.parameters()).device}",
             flush=True,
         )
+        print(
+            f"Resize mode: {resize_mode}",
+            flush=True,
+        )
 
         dataset = FacialDataset(
             frame,
-            build_transforms(config["image_size"]),
+            build_transforms(
+                config["image_size"],
+                resize_mode=resize_mode,
+            ),
             labelled=False,
         )
-
         loader = make_loader(
             dataset,
             args.batch_size,
@@ -276,13 +279,19 @@ def main():
         else:
             average_probabilities += probabilities
 
+        model_details.append({
+            "checkpoint": str(checkpoint_path),
+            "architecture": config["architecture"],
+            "image_size": config["image_size"],
+            "resize_mode": resize_mode,
+        })
+
         del loader, dataset, model, checkpoint
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     average_probabilities /= len(args.checkpoint)
-
     predicted_indices = (
         average_probabilities.argmax(axis=1)
     )
@@ -301,7 +310,6 @@ def main():
         parents=True,
         exist_ok=True,
     )
-
     submission.to_csv(
         args.output,
         index=False,
@@ -311,9 +319,9 @@ def main():
         metadata_path,
         {
             "checkpoints": [
-                str(path)
-                for path in args.checkpoint
+                str(path) for path in args.checkpoint
             ],
+            "models": model_details,
             "flip_tta": args.flip_tta,
             "ensemble": (
                 "Equal arithmetic mean of probabilities"

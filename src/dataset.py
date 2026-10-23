@@ -1,3 +1,5 @@
+"""Image transforms, datasets and CPU data loaders."""
+
 import random
 
 import numpy as np
@@ -16,15 +18,72 @@ from config import (
 )
 
 
-def build_transforms(image_size, training=False):
-    # Resize the full crop rather than cutting off features.
-    operations = [
-        transforms.Resize(
+class ResizeWithPadding:
+    """Preserve image proportions and centre on a square."""
+
+    def __init__(self, image_size):
+        self.image_size = int(image_size)
+
+        if self.image_size < 1:
+            raise ValueError("image_size must be positive.")
+
+        self.fill = tuple(round(value * 255) for value in MEAN)
+
+    def __call__(self, image):
+        image = image.convert("RGB")
+        width, height = image.size
+        scale = self.image_size / max(width, height)
+
+        new_width = max(
+            1,
+            min(self.image_size, round(width * scale)),
+        )
+        new_height = max(
+            1,
+            min(self.image_size, round(height * scale)),
+        )
+
+        resized = image.resize(
+            (new_width, new_height),
+            resample=Image.Resampling.BILINEAR,
+        )
+
+        canvas = Image.new(
+            "RGB",
+            (self.image_size, self.image_size),
+            color=self.fill,
+        )
+
+        canvas.paste(
+            resized,
+            (
+                (self.image_size - new_width) // 2,
+                (self.image_size - new_height) // 2,
+            ),
+        )
+
+        return canvas
+
+
+def build_transforms(
+    image_size,
+    training=False,
+    resize_mode="stretch",
+):
+    if resize_mode == "stretch":
+        resize = transforms.Resize(
             (image_size, image_size),
             interpolation=InterpolationMode.BILINEAR,
             antialias=True,
         )
-    ]
+    elif resize_mode == "pad":
+        resize = ResizeWithPadding(image_size)
+    else:
+        raise ValueError(
+            f"Unknown resize mode: {resize_mode}"
+        )
+
+    operations = [resize]
 
     if training:
         operations.extend([
@@ -58,10 +117,7 @@ class FacialDataset(Dataset):
         root=PROJECT_ROOT,
         labelled=True,
     ):
-        self.frame = frame.reset_index(
-            drop=True
-        ).copy()
-
+        self.frame = frame.reset_index(drop=True).copy()
         self.transform = transform
         self.root = root
         self.labelled = labelled
@@ -70,6 +126,13 @@ class FacialDataset(Dataset):
 
         if labelled:
             required.append("class")
+
+        missing = set(required) - set(self.frame.columns)
+
+        if missing:
+            raise ValueError(
+                f"Dataset is missing columns: {missing}"
+            )
 
         if (
             self.frame.empty
@@ -99,9 +162,7 @@ class FacialDataset(Dataset):
         image_path = self.root / row["path"]
 
         with Image.open(image_path) as image:
-            tensor = self.transform(
-                image.convert("RGB")
-            )
+            tensor = self.transform(image.convert("RGB"))
 
         target = (
             CLASS_TO_INDEX[row["class"]]
@@ -114,11 +175,10 @@ class FacialDataset(Dataset):
 
 def seed_worker(worker_id):
     seed = torch.initial_seed() % (2**32)
-
     random.seed(seed)
     np.random.seed(seed)
 
-    # Avoid each worker creating many extra CPU threads.
+    # Prevent every worker starting many CPU threads.
     torch.set_num_threads(1)
 
 

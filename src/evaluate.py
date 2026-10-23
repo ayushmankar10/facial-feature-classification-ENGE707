@@ -1,3 +1,5 @@
+"""Evaluate a checkpoint using its saved preprocessing."""
+
 import argparse
 import multiprocessing
 from pathlib import Path
@@ -10,7 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
@@ -21,11 +22,7 @@ from sklearn.metrics import (
     log_loss,
 )
 
-from config import (
-    CLASSES,
-    PROJECT_ROOT,
-    SPLIT_DIR,
-)
+from config import CLASSES, PROJECT_ROOT, SPLIT_DIR
 from dataset import (
     FacialDataset,
     build_transforms,
@@ -44,9 +41,8 @@ from utils import (
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate a model on validation data."
+        description=__doc__
     )
-
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -70,11 +66,34 @@ def main():
         "--flip-tta",
         action="store_true",
     )
-
     args = parser.parse_args()
 
-    torch.set_num_threads(4)
+    if args.workers < 0 or args.batch_size < 1:
+        parser.error(
+            "workers must be >= 0 and batch-size "
+            "must be positive."
+        )
 
+    evaluation_name = (
+        "evaluation_flip"
+        if args.flip_tta
+        else "evaluation"
+    )
+    output_dir = (
+        PROJECT_ROOT
+        / "outputs"
+        / "runs"
+        / args.checkpoint.parent.name
+        / evaluation_name
+    )
+
+    if output_dir.exists():
+        raise FileExistsError(
+            f"Evaluation already exists: {output_dir}. "
+            "Archive it before rerunning."
+        )
+
+    torch.set_num_threads(4)
     checkpoint = load_checkpoint(args.checkpoint)
 
     if checkpoint.get("smoke"):
@@ -93,17 +112,22 @@ def main():
         )
 
     config = checkpoint["config"]
-    device = choose_device(args.allow_cpu)
 
-    frame = read_split(
-        SPLIT_DIR / "validation.csv"
-    )
+    # Checkpoints created before this setting used stretching.
+    resize_mode = config.get("resize_mode", "stretch")
+
+    device = choose_device(args.allow_cpu)
+    print(f"Resize mode: {resize_mode}", flush=True)
+
+    frame = read_split(SPLIT_DIR / "validation.csv")
 
     dataset = FacialDataset(
         frame,
-        build_transforms(config["image_size"]),
+        build_transforms(
+            config["image_size"],
+            resize_mode=resize_mode,
+        ),
     )
-
     loader = make_loader(
         dataset,
         args.batch_size,
@@ -115,11 +139,7 @@ def main():
         config["architecture"],
         pretrained=False,
     )
-
-    model.load_state_dict(
-        checkpoint["model_state"]
-    )
-
+    model.load_state_dict(checkpoint["model_state"])
     model.to(
         device,
         memory_format=torch.channels_last,
@@ -133,6 +153,11 @@ def main():
         flip_tta=args.flip_tta,
     )
 
+    if frame["image_id"].tolist() != ids:
+        raise RuntimeError(
+            "Validation prediction order changed."
+        )
+
     predicted = probabilities.argmax(axis=1)
 
     metrics = {
@@ -140,9 +165,7 @@ def main():
             accuracy_score(targets, predicted)
         ),
         "balanced_accuracy": float(
-            balanced_accuracy_score(
-                targets, predicted
-            )
+            balanced_accuracy_score(targets, predicted)
         ),
         "macro_f1": float(
             f1_score(
@@ -160,27 +183,8 @@ def main():
         ),
         "checkpoint": str(args.checkpoint),
         "flip_tta": args.flip_tta,
+        "resize_mode": resize_mode,
     }
-
-    evaluation_name = (
-        "evaluation_flip"
-        if args.flip_tta
-        else "evaluation"
-    )
-
-    output_dir = (
-        PROJECT_ROOT
-        / "outputs"
-        / "runs"
-        / args.checkpoint.parent.name
-        / evaluation_name
-    )
-
-    if output_dir.exists():
-        raise FileExistsError(
-            f"Evaluation already exists: {output_dir}. "
-            "Archive it before rerunning."
-        )
 
     output_dir.mkdir(parents=True)
 
@@ -197,30 +201,20 @@ def main():
         output_dict=True,
         zero_division=0,
     )
-
     pd.DataFrame(report).transpose().to_csv(
         output_dir / "classification_report.csv"
     )
 
     predictions = frame.copy()
-
-    if predictions["image_id"].tolist() != ids:
-        raise RuntimeError(
-            "Validation prediction order changed."
-        )
-
     predictions["predicted_class"] = [
         CLASSES[index] for index in predicted
     ]
-    predictions["confidence"] = (
-        probabilities.max(axis=1)
-    )
+    predictions["confidence"] = probabilities.max(axis=1)
 
     predictions.to_csv(
         output_dir / "predictions.csv",
         index=False,
     )
-
     predictions.loc[
         targets != predicted
     ].to_csv(
@@ -240,7 +234,6 @@ def main():
         predicted,
         labels=range(len(CLASSES)),
     )
-
     pd.DataFrame(
         matrix,
         index=CLASSES,
@@ -249,10 +242,7 @@ def main():
         output_dir / "confusion_matrix.csv"
     )
 
-    fig, ax = plt.subplots(
-        figsize=(10, 8)
-    )
-
+    fig, ax = plt.subplots(figsize=(10, 8))
     ConfusionMatrixDisplay(
         matrix,
         display_labels=CLASSES,
@@ -261,7 +251,6 @@ def main():
         xticks_rotation=45,
         colorbar=False,
     )
-
     fig.tight_layout()
     fig.savefig(
         output_dir / "confusion_matrix.png",

@@ -1,3 +1,5 @@
+"""Train with CUDA, CPU data workers and saved preprocessing."""
+
 import argparse
 import multiprocessing
 import time
@@ -45,11 +47,9 @@ def run_epoch(
     max_batches=0,
 ):
     training = optimizer is not None
-
     model.train(training)
 
     if training and freeze_backbone:
-        # Keep frozen backbone BatchNorm statistics fixed.
         for module in model.modules():
             if isinstance(
                 module,
@@ -62,22 +62,18 @@ def run_epoch(
         device=device,
         dtype=torch.float64,
     )
-
     started = time.perf_counter()
 
-    for step, batch in enumerate(loader, start=1):
-        images, labels, _ = batch
-
+    for step, (images, labels, _) in enumerate(
+        loader,
+        start=1,
+    ):
         images = images.to(
             device,
             non_blocking=True,
             memory_format=torch.channels_last,
         )
-
-        labels = labels.to(
-            device,
-            non_blocking=True,
-        )
+        labels = labels.to(device, non_blocking=True)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -92,31 +88,24 @@ def run_epoch(
 
             if training:
                 scaler.scale(loss).backward()
-
                 scaler.unscale_(optimizer)
-
                 nn.utils.clip_grad_norm_(
                     model.parameters(),
-                    max_norm=5.0,
+                    5.0,
                 )
-
                 scaler.step(optimizer)
                 scaler.update()
 
         totals[0] += (
-            loss.detach().double()
-            * labels.size(0)
+            loss.detach().double() * labels.size(0)
         )
         totals[1] += (
-            logits.detach().argmax(dim=1) == labels
+            logits.detach().argmax(1) == labels
         ).sum()
         totals[2] += labels.size(0)
 
         if step % 100 == 0:
-            phase = (
-                "train" if training else "validation"
-            )
-
+            phase = "train" if training else "validation"
             print(
                 f"  {phase} batch {step}/{len(loader)}",
                 flush=True,
@@ -126,6 +115,9 @@ def run_epoch(
             break
 
     loss_sum, correct, count = totals.cpu().tolist()
+
+    if count == 0:
+        raise ValueError("Data loader produced no images.")
 
     return {
         "loss": loss_sum / count,
@@ -138,24 +130,23 @@ def run_epoch(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train the facial-feature classifier."
+        description=__doc__
     )
-
-    parser.add_argument(
-        "--run",
-        required=True,
-        help="Unique experiment folder name.",
-    )
-
-    parser.add_argument(
-        "--architecture",
-        choices=["efficientnet_b0", "resnet18"],
-        default="efficientnet_b0",
-    )
-
     defaults = TrainConfig()
 
-    integer_arguments = [
+    parser.add_argument("--run", required=True)
+    parser.add_argument(
+        "--architecture",
+        choices=("efficientnet_b0", "resnet18"),
+        default=defaults.architecture,
+    )
+    parser.add_argument(
+        "--resize-mode",
+        choices=("stretch", "pad"),
+        default=defaults.resize_mode,
+    )
+
+    integer_options = (
         "epochs",
         "batch_size",
         "workers",
@@ -165,23 +156,23 @@ def main():
         "patience",
         "seed",
         "min_train_side",
-    ]
+    )
 
-    for name in integer_arguments:
+    for name in integer_options:
         parser.add_argument(
             "--" + name.replace("_", "-"),
             type=int,
             default=getattr(defaults, name),
         )
 
-    float_arguments = [
+    float_options = (
         "learning_rate",
         "head_learning_rate",
         "weight_decay",
         "label_smoothing",
-    ]
+    )
 
-    for name in float_arguments:
+    for name in float_options:
         parser.add_argument(
             "--" + name.replace("_", "-"),
             type=float,
@@ -203,10 +194,7 @@ def main():
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help=(
-            "Two batches per phase for one epoch. "
-            "Only checks the pipeline."
-        ),
+        help="Two batches per phase for one epoch.",
     )
 
     args = parser.parse_args()
@@ -217,12 +205,9 @@ def main():
         "0123456789_-"
     )
 
-    if (
-        not args.run
-        or any(
-            character not in allowed_characters
-            for character in args.run
-        )
+    if not args.run or any(
+        character not in allowed_characters
+        for character in args.run
     ):
         parser.error(
             "--run may only contain letters, numbers, "
@@ -280,14 +265,22 @@ def main():
         config.epochs = 1
         config.freeze_epochs = 0
 
+    run_dir = (
+        PROJECT_ROOT / "outputs" / "runs" / args.run
+    )
+    checkpoint_dir = PROJECT_ROOT / "models" / args.run
+
+    if run_dir.exists() or checkpoint_dir.exists():
+        raise FileExistsError(
+            "This run already exists. Use a new "
+            "--run name to preserve its results."
+        )
+
     seed_everything(config.seed)
     torch.set_num_threads(config.cpu_threads)
-
     device = choose_device(args.allow_cpu)
 
-    train_frame = read_split(
-        SPLIT_DIR / "train.csv"
-    )
+    train_frame = read_split(SPLIT_DIR / "train.csv")
     validation_frame = read_split(
         SPLIT_DIR / "validation.csv"
     )
@@ -296,7 +289,6 @@ def main():
         set(train_frame["pixel_hash"])
         & set(validation_frame["pixel_hash"])
     )
-
     id_overlap = (
         set(train_frame["image_id"])
         & set(validation_frame["image_id"])
@@ -307,7 +299,7 @@ def main():
             "Training and validation data overlap."
         )
 
-    # Any size filtering affects training only.
+    # Size filtering affects training only.
     minimum_side = train_frame[
         ["width", "height"]
     ].min(axis=1)
@@ -336,30 +328,20 @@ def main():
             group_keys=False,
         ).head(2)
 
-    run_dir = (
-        PROJECT_ROOT
-        / "outputs"
-        / "runs"
-        / args.run
-    )
-
-    if run_dir.exists():
-        raise FileExistsError(
-            "This run already exists. Use a new "
-            "--run name to preserve its results."
-        )
-
     train_dataset = FacialDataset(
         train_frame,
         build_transforms(
             config.image_size,
             training=True,
+            resize_mode=config.resize_mode,
         ),
     )
-
     validation_dataset = FacialDataset(
         validation_frame,
-        build_transforms(config.image_size),
+        build_transforms(
+            config.image_size,
+            resize_mode=config.resize_mode,
+        ),
     )
 
     train_loader = make_loader(
@@ -370,7 +352,6 @@ def main():
         cuda=device.type == "cuda",
         seed=config.seed,
     )
-
     validation_loader = make_loader(
         validation_dataset,
         config.batch_size,
@@ -382,15 +363,17 @@ def main():
     model = build_model(
         config.architecture,
         config.pretrained,
-    )
-
-    model = model.to(
+    ).to(
         device,
         memory_format=torch.channels_last,
     )
 
     print(
         f"Model device: {next(model.parameters()).device}",
+        flush=True,
+    )
+    print(
+        f"Resize mode: {config.resize_mode}",
         flush=True,
     )
     print(
@@ -407,19 +390,15 @@ def main():
         parameter_groups(model, config),
         weight_decay=config.weight_decay,
     )
-
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=config.epochs,
         )
     )
-
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=(
-            config.amp and device.type == "cuda"
-        ),
+        enabled=config.amp and device.type == "cuda",
     )
 
     train_criterion = nn.CrossEntropyLoss(
@@ -428,7 +407,6 @@ def main():
     validation_criterion = nn.CrossEntropyLoss()
 
     run_dir.mkdir(parents=True)
-
     fingerprint = split_fingerprint()
 
     write_json(
@@ -451,10 +429,6 @@ def main():
     bad_epochs = 0
     history = []
 
-    checkpoint_dir = (
-        PROJECT_ROOT / "models" / args.run
-    )
-
     for epoch in range(config.epochs):
         frozen = (
             config.pretrained
@@ -472,7 +446,6 @@ def main():
             f"frozen backbone: {frozen}",
             flush=True,
         )
-
         started = time.perf_counter()
 
         train_stats = run_epoch(
@@ -486,7 +459,6 @@ def main():
             freeze_backbone=frozen,
             max_batches=2 if args.smoke else 0,
         )
-
         validation_stats = run_epoch(
             model,
             validation_loader,
@@ -502,31 +474,24 @@ def main():
             "train_accuracy": train_stats["accuracy"],
             "val_loss": validation_stats["loss"],
             "val_accuracy": validation_stats["accuracy"],
-            "learning_rate": (
-                optimizer.param_groups[0]["lr"]
-            ),
-            "seconds": (
-                time.perf_counter() - started
-            ),
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "seconds": time.perf_counter() - started,
             "train_images_per_second": (
                 train_stats["images_per_second"]
             ),
         }
-
         history.append(row)
 
         pd.DataFrame(history).to_csv(
             run_dir / "history.csv",
             index=False,
         )
-
         scheduler.step()
 
         improved = (
             validation_stats["accuracy"] > best_accuracy
             or (
-                validation_stats["accuracy"]
-                == best_accuracy
+                validation_stats["accuracy"] == best_accuracy
                 and validation_stats["loss"] < best_loss
             )
         )
@@ -573,8 +538,7 @@ def main():
             break
 
     print(
-        f"\nBest validation accuracy: "
-        f"{best_accuracy:.4f}"
+        f"\nBest validation accuracy: {best_accuracy:.4f}"
     )
     print(
         f"Checkpoint: {checkpoint_dir / 'best.pt'}"
