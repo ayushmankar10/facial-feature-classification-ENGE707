@@ -250,6 +250,7 @@ def main():
             or (
                 args.v2s_flip_tta
                 and architecture == "efficientnet_v2_s"
+                and config["image_size"] == 224
             )
         )
 
@@ -396,4 +397,3 @@ def main():
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
-    
