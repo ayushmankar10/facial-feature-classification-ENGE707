@@ -1,4 +1,4 @@
-"""Generate submissions using each checkpoint's preprocessing."""
+"""Generate Kaggle submissions with optional selective flip TTA."""
 
 import argparse
 import multiprocessing
@@ -137,6 +137,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__
     )
+
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -148,6 +149,7 @@ def main():
         "--output",
         type=Path,
         required=True,
+        help="Output submission CSV path.",
     )
     parser.add_argument(
         "--workers",
@@ -159,24 +161,44 @@ def main():
         type=int,
         default=16,
     )
-    parser.add_argument(
+
+    tta_options = parser.add_mutually_exclusive_group()
+
+    tta_options.add_argument(
         "--flip-tta",
         action="store_true",
+        help="Apply horizontal-flip TTA to every model.",
     )
+    tta_options.add_argument(
+        "--v2s-flip-tta",
+        action="store_true",
+        help="Apply horizontal-flip TTA only to EfficientNetV2-S.",
+    )
+
     parser.add_argument(
         "--allow-cpu",
         action="store_true",
     )
+
     args = parser.parse_args()
 
     if args.batch_size < 1 or args.workers < 0:
         parser.error(
-            "batch-size must be positive and workers "
-            "must be zero or greater."
+            "batch-size must be positive and "
+            "workers must be zero or greater."
         )
 
     if args.output.suffix.lower() != ".csv":
         parser.error("--output must end in .csv")
+
+    resolved_checkpoints = [
+        path.resolve() for path in args.checkpoint
+    ]
+
+    if len(set(resolved_checkpoints)) != len(resolved_checkpoints):
+        parser.error(
+            "The same checkpoint was supplied more than once."
+        )
 
     metadata_path = args.output.with_suffix(".json")
 
@@ -199,6 +221,7 @@ def main():
         SAMPLE_PATH,
         dtype={"image_id": "string"},
     )
+
     frame = make_test_frame(sample)
 
     average_probabilities = None
@@ -219,29 +242,45 @@ def main():
             )
 
         config = checkpoint["config"]
-        resize_mode = config.get(
-            "resize_mode", "stretch"
+        architecture = config["architecture"]
+        resize_mode = config.get("resize_mode", "stretch")
+
+        use_flip_tta = (
+            args.flip_tta
+            or (
+                args.v2s_flip_tta
+                and architecture == "efficientnet_v2_s"
+            )
         )
 
         model = build_model(
-            config["architecture"],
+            architecture,
             pretrained=False,
         )
+
         model.load_state_dict(
             checkpoint["model_state"]
         )
+
         model.to(
             device,
             memory_format=torch.channels_last,
         )
 
         print(
-            f"Model device: "
-            f"{next(model.parameters()).device}",
+            f"Architecture: {architecture}",
+            flush=True,
+        )
+        print(
+            f"Model device: {next(model.parameters()).device}",
             flush=True,
         )
         print(
             f"Resize mode: {resize_mode}",
+            flush=True,
+        )
+        print(
+            f"Flip TTA: {use_flip_tta}",
             flush=True,
         )
 
@@ -253,6 +292,7 @@ def main():
             ),
             labelled=False,
         )
+
         loader = make_loader(
             dataset,
             args.batch_size,
@@ -265,7 +305,7 @@ def main():
             loader,
             device,
             amp=config["amp"],
-            flip_tta=args.flip_tta,
+            flip_tta=use_flip_tta,
         )
 
         if ids != sample["image_id"].tolist():
@@ -277,13 +317,19 @@ def main():
         if average_probabilities is None:
             average_probabilities = probabilities
         else:
+            if probabilities.shape != average_probabilities.shape:
+                raise RuntimeError(
+                    "Models produced different prediction shapes."
+                )
+
             average_probabilities += probabilities
 
         model_details.append({
             "checkpoint": str(checkpoint_path),
-            "architecture": config["architecture"],
+            "architecture": architecture,
             "image_size": config["image_size"],
             "resize_mode": resize_mode,
+            "flip_tta": bool(use_flip_tta),
         })
 
         del loader, dataset, model, checkpoint
@@ -292,6 +338,7 @@ def main():
             torch.cuda.empty_cache()
 
     average_probabilities /= len(args.checkpoint)
+
     predicted_indices = (
         average_probabilities.argmax(axis=1)
     )
@@ -310,6 +357,7 @@ def main():
         parents=True,
         exist_ok=True,
     )
+
     submission.to_csv(
         args.output,
         index=False,
@@ -323,8 +371,11 @@ def main():
             ],
             "models": model_details,
             "flip_tta": args.flip_tta,
+            "v2s_flip_tta": args.v2s_flip_tta,
             "ensemble": (
-                "Equal arithmetic mean of probabilities"
+                "Equal arithmetic mean of model probabilities. "
+                "For models using TTA, original and flipped "
+                "probabilities are averaged first."
             ),
             "rows": len(submission),
             "classes": list(CLASSES),
@@ -334,10 +385,11 @@ def main():
     print(
         f"\nValidated {len(submission):,} predictions."
     )
-    print(f"Submission saved to: {args.output}")
     print(
-        "Upload this CSV through Kaggle "
-        "Submit Prediction."
+        f"Submission saved to: {args.output}"
+    )
+    print(
+        "Upload this CSV through Kaggle Submit Prediction."
     )
 
 
