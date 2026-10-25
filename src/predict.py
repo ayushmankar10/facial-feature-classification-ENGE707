@@ -172,7 +172,20 @@ def main():
     tta_options.add_argument(
         "--v2s-flip-tta",
         action="store_true",
-        help="Apply horizontal-flip TTA only to EfficientNetV2-S.",
+        help=(
+            "Apply horizontal-flip TTA only to "
+            "EfficientNetV2-S checkpoints at image size 224."
+        ),
+    )
+    tta_options.add_argument(
+        "--flip-tta-checkpoint",
+        type=Path,
+        nargs="+",
+        default=[],
+        help=(
+            "Apply horizontal-flip TTA only to these "
+            "checkpoints. Each must also appear in --checkpoint."
+        ),
     )
 
     parser.add_argument(
@@ -198,6 +211,16 @@ def main():
     if len(set(resolved_checkpoints)) != len(resolved_checkpoints):
         parser.error(
             "The same checkpoint was supplied more than once."
+        )
+
+    selected_tta = {
+        path.resolve()
+        for path in args.flip_tta_checkpoint
+    }
+
+    if not selected_tta.issubset(set(resolved_checkpoints)):
+        parser.error(
+            "TTA checkpoints must also appear in --checkpoint."
         )
 
     metadata_path = args.output.with_suffix(".json")
@@ -247,6 +270,7 @@ def main():
 
         use_flip_tta = (
             args.flip_tta
+            or checkpoint_path.resolve() in selected_tta
             or (
                 args.v2s_flip_tta
                 and architecture == "efficientnet_v2_s"
@@ -373,6 +397,10 @@ def main():
             "models": model_details,
             "flip_tta": args.flip_tta,
             "v2s_flip_tta": args.v2s_flip_tta,
+            "flip_tta_checkpoints": [
+                str(path)
+                for path in args.flip_tta_checkpoint
+            ],
             "ensemble": (
                 "Equal arithmetic mean of model probabilities. "
                 "For models using TTA, original and flipped "
