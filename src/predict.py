@@ -1,9 +1,10 @@
-"""Generate Kaggle submissions with optional selective flip TTA."""
+"""Generate Kaggle submissions with selective TTA and ensemble averaging."""
 
 import argparse
 import multiprocessing
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -14,11 +15,7 @@ from config import (
     SAMPLE_PATH,
     TEST_DIR,
 )
-from dataset import (
-    FacialDataset,
-    build_transforms,
-    make_loader,
-)
+from dataset import FacialDataset, build_transforms, make_loader
 from model import build_model
 from utils import (
     choose_device,
@@ -32,11 +29,7 @@ from utils import (
 def matching_key(value):
     """Match numeric filenames with or without leading zeros."""
     stem = Path(str(value)).stem
-
-    if stem.isdecimal():
-        return str(int(stem))
-
-    return stem
+    return str(int(stem)) if stem.isdecimal() else stem
 
 
 def make_test_frame(sample, test_dir=TEST_DIR):
@@ -45,24 +38,19 @@ def make_test_frame(sample, test_dir=TEST_DIR):
         or sample.empty
     ):
         raise ValueError(
-            "Expected a nonempty sample template "
-            "with image_id,class columns."
+            "Expected a nonempty template with image_id,class columns."
         )
 
     if (
         sample["image_id"].isna().any()
         or sample["image_id"].duplicated().any()
     ):
-        raise ValueError(
-            "Template IDs must be present and unique."
-        )
+        raise ValueError("Template IDs must be present and unique.")
 
     test_dir = Path(test_dir)
 
     if not test_dir.is_dir():
-        raise FileNotFoundError(
-            f"Test folder not found: {test_dir}"
-        )
+        raise FileNotFoundError(f"Test folder not found: {test_dir}")
 
     lookup = {}
 
@@ -76,7 +64,7 @@ def make_test_frame(sample, test_dir=TEST_DIR):
             if key in lookup:
                 raise ValueError(
                     f"Multiple test files match ID {key}: "
-                    f"{lookup[key].name} and {path.name}"
+                    f"{lookup[key]} and {path}"
                 )
 
             lookup[key] = path
@@ -90,8 +78,7 @@ def make_test_frame(sample, test_dir=TEST_DIR):
 
     if template_keys.duplicated().any():
         raise ValueError(
-            "Multiple template IDs refer to the same "
-            "numeric image ID."
+            "Multiple template IDs refer to the same numeric image ID."
         )
 
     rows = []
@@ -101,12 +88,11 @@ def make_test_frame(sample, test_dir=TEST_DIR):
 
         if key not in lookup:
             examples = [
-                path.name
-                for path in list(lookup.values())[:5]
+                path.name for path in list(lookup.values())[:5]
             ]
             raise FileNotFoundError(
                 f"No test file for template ID {image_id}. "
-                f"Example test filenames: {examples}"
+                f"Example filenames: {examples}"
             )
 
         rows.append({
@@ -120,23 +106,56 @@ def make_test_frame(sample, test_dir=TEST_DIR):
 
     if len(lookup) != len(rows):
         raise ValueError(
-            f"Found {len(lookup):,} test images, but the "
-            f"template contains {len(rows):,} rows."
+            f"Found {len(lookup):,} test images, but "
+            f"the template contains {len(rows):,} rows."
         )
 
     print(
-        f"Matched all {len(rows):,} template IDs "
-        "to test images.",
+        f"Matched all {len(rows):,} template IDs to test images.",
         flush=True,
     )
 
     return pd.DataFrame(rows)
 
 
+def ensemble_contribution(probabilities, method, expected_rows):
+    """Validate probabilities and prepare an equal-weight contribution."""
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+
+    expected_shape = (expected_rows, len(CLASSES))
+
+    if probabilities.shape != expected_shape:
+        raise RuntimeError(
+            f"Expected probabilities with shape {expected_shape}, "
+            f"received {probabilities.shape}."
+        )
+
+    if not np.isfinite(probabilities).all():
+        raise RuntimeError("Predictions contain NaN or infinity.")
+
+    if (
+        (probabilities < 0).any()
+        or (probabilities > 1).any()
+    ):
+        raise RuntimeError("Probabilities must be between zero and one.")
+
+    if not np.allclose(
+        probabilities.sum(axis=1),
+        1.0,
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise RuntimeError("Class probabilities do not sum to one.")
+
+    if method == "geometric":
+        # Match the validation experiment and avoid log(0).
+        return np.log(np.clip(probabilities, 1e-12, 1.0))
+
+    return probabilities
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
 
     parser.add_argument(
         "--checkpoint",
@@ -151,15 +170,13 @@ def main():
         required=True,
         help="Output submission CSV path.",
     )
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=2,
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=16,
+        "--ensemble",
+        choices=["arithmetic", "geometric"],
+        default="arithmetic",
+        help="How to combine probabilities across models.",
     )
 
     tta_options = parser.add_mutually_exclusive_group()
@@ -172,10 +189,7 @@ def main():
     tta_options.add_argument(
         "--v2s-flip-tta",
         action="store_true",
-        help=(
-            "Apply horizontal-flip TTA only to "
-            "EfficientNetV2-S checkpoints at image size 224."
-        ),
+        help="Apply flip TTA to EfficientNetV2-S at image size 224.",
     )
     tta_options.add_argument(
         "--flip-tta-checkpoint",
@@ -183,22 +197,18 @@ def main():
         nargs="+",
         default=[],
         help=(
-            "Apply horizontal-flip TTA only to these "
-            "checkpoints. Each must also appear in --checkpoint."
+            "Apply flip TTA only to these checkpoints. "
+            "Each must also appear in --checkpoint."
         ),
     )
 
-    parser.add_argument(
-        "--allow-cpu",
-        action="store_true",
-    )
+    parser.add_argument("--allow-cpu", action="store_true")
 
     args = parser.parse_args()
 
     if args.batch_size < 1 or args.workers < 0:
         parser.error(
-            "batch-size must be positive and "
-            "workers must be zero or greater."
+            "batch-size must be positive; workers must be >= 0."
         )
 
     if args.output.suffix.lower() != ".csv":
@@ -209,13 +219,10 @@ def main():
     ]
 
     if len(set(resolved_checkpoints)) != len(resolved_checkpoints):
-        parser.error(
-            "The same checkpoint was supplied more than once."
-        )
+        parser.error("The same checkpoint was supplied more than once.")
 
     selected_tta = {
-        path.resolve()
-        for path in args.flip_tta_checkpoint
+        path.resolve() for path in args.flip_tta_checkpoint
     }
 
     if not selected_tta.issubset(set(resolved_checkpoints)):
@@ -244,11 +251,15 @@ def main():
         SAMPLE_PATH,
         dtype={"image_id": "string"},
     )
-
     frame = make_test_frame(sample)
 
-    average_probabilities = None
+    ensemble_scores = None
     model_details = []
+
+    print(
+        f"Ensemble method: {args.ensemble}",
+        flush=True,
+    )
 
     for checkpoint_path in args.checkpoint:
         print(
@@ -260,8 +271,7 @@ def main():
 
         if checkpoint.get("smoke"):
             raise ValueError(
-                "Cannot submit predictions from "
-                "a smoke-test checkpoint."
+                "Cannot submit predictions from a smoke-test checkpoint."
             )
 
         config = checkpoint["config"]
@@ -278,36 +288,18 @@ def main():
             )
         )
 
-        model = build_model(
-            architecture,
-            pretrained=False,
-        )
+        model = build_model(architecture, pretrained=False)
+        model.load_state_dict(checkpoint["model_state"])
+        model.to(device, memory_format=torch.channels_last)
+        model.eval()
 
-        model.load_state_dict(
-            checkpoint["model_state"]
-        )
-
-        model.to(
-            device,
-            memory_format=torch.channels_last,
-        )
-
-        print(
-            f"Architecture: {architecture}",
-            flush=True,
-        )
+        print(f"Architecture: {architecture}", flush=True)
         print(
             f"Model device: {next(model.parameters()).device}",
             flush=True,
         )
-        print(
-            f"Resize mode: {resize_mode}",
-            flush=True,
-        )
-        print(
-            f"Flip TTA: {use_flip_tta}",
-            flush=True,
-        )
+        print(f"Resize mode: {resize_mode}", flush=True)
+        print(f"Flip TTA: {use_flip_tta}", flush=True)
 
         dataset = FacialDataset(
             frame,
@@ -333,21 +325,23 @@ def main():
             flip_tta=use_flip_tta,
         )
 
-        if ids != sample["image_id"].tolist():
+        if list(ids) != sample["image_id"].tolist():
             raise RuntimeError(
-                "Prediction order does not match "
-                "the sample template."
+                "Prediction order does not match the sample template."
             )
 
-        if average_probabilities is None:
-            average_probabilities = probabilities
-        else:
-            if probabilities.shape != average_probabilities.shape:
-                raise RuntimeError(
-                    "Models produced different prediction shapes."
-                )
+        # predict_batches first averages original and flipped views
+        # for each model. Each model then receives equal ensemble weight.
+        contribution = ensemble_contribution(
+            probabilities,
+            args.ensemble,
+            len(sample),
+        )
 
-            average_probabilities += probabilities
+        if ensemble_scores is None:
+            ensemble_scores = contribution
+        else:
+            ensemble_scores += contribution
 
         model_details.append({
             "checkpoint": str(checkpoint_path),
@@ -355,38 +349,32 @@ def main():
             "image_size": config["image_size"],
             "resize_mode": resize_mode,
             "flip_tta": bool(use_flip_tta),
+            "weight": 1.0 / len(args.checkpoint),
         })
 
         del loader, dataset, model, checkpoint
+        del probabilities, contribution
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    average_probabilities /= len(args.checkpoint)
+    ensemble_scores /= len(args.checkpoint)
 
-    predicted_indices = (
-        average_probabilities.argmax(axis=1)
-    )
+    # For geometric averaging these are mean log-probabilities.
+    # Exponentiation and normalisation do not change the argmax.
+    predicted_indices = ensemble_scores.argmax(axis=1)
 
     submission = pd.DataFrame({
         "image_id": sample["image_id"],
         "class": [
-            CLASSES[index]
-            for index in predicted_indices
+            CLASSES[index] for index in predicted_indices
         ],
     })
 
     validate_submission(submission, sample)
 
-    args.output.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    submission.to_csv(
-        args.output,
-        index=False,
-    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(args.output, index=False)
 
     write_json(
         metadata_path,
@@ -395,31 +383,28 @@ def main():
                 str(path) for path in args.checkpoint
             ],
             "models": model_details,
+            "ensemble_method": args.ensemble,
+            "probability_floor": (
+                1e-12 if args.ensemble == "geometric" else None
+            ),
             "flip_tta": args.flip_tta,
             "v2s_flip_tta": args.v2s_flip_tta,
             "flip_tta_checkpoints": [
-                str(path)
-                for path in args.flip_tta_checkpoint
+                str(path) for path in args.flip_tta_checkpoint
             ],
             "ensemble": (
-                "Equal arithmetic mean of model probabilities. "
-                "For models using TTA, original and flipped "
-                "probabilities are averaged first."
+                f"Equal-weight {args.ensemble} mean across models. "
+                "Original and flipped probabilities are averaged "
+                "arithmetically within each TTA model first."
             ),
             "rows": len(submission),
             "classes": list(CLASSES),
         },
     )
 
-    print(
-        f"\nValidated {len(submission):,} predictions."
-    )
-    print(
-        f"Submission saved to: {args.output}"
-    )
-    print(
-        "Upload this CSV through Kaggle Submit Prediction."
-    )
+    print(f"\nValidated {len(submission):,} predictions.")
+    print(f"Submission saved to: {args.output}")
+    print("Upload this CSV through Kaggle Submit Prediction.")
 
 
 if __name__ == "__main__":
